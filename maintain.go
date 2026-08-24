@@ -659,11 +659,16 @@ func CleanStorage(ctx context.Context, storage Storage, opts CleanStorageOptions
 
 	// storage cleaning should be globally exclusive
 	if err := acquireLock(ctx, storage, lockName); err != nil {
+		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return fmt.Errorf("unable to acquire %s lock: %v", lockName, err)
 	}
 	defer func() {
 		if err := releaseLock(ctx, storage, lockName); err != nil {
-			opts.Logger.Error("unable to release lock", zap.Error(err))
+			if !errors.Is(err, context.Canceled) && ctx.Err() == nil {
+				opts.Logger.Error("unable to release lock", zap.Error(err))
+			}
 			return
 		}
 	}()
@@ -673,6 +678,9 @@ func CleanStorage(ctx context.Context, storage Storage, opts CleanStorageOptions
 		lastCleanBytes, err := storage.Load(ctx, storageKey)
 		if !errors.Is(err, fs.ErrNotExist) {
 			if err != nil {
+				if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+					return ctx.Err()
+				}
 				return fmt.Errorf("loading last clean timestamp: %v", err)
 			}
 
@@ -700,16 +708,26 @@ func CleanStorage(ctx context.Context, storage Storage, opts CleanStorageOptions
 	if opts.OCSPStaples {
 		err := deleteOldOCSPStaples(ctx, storage, opts.Logger)
 		if err != nil {
+			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+				return ctx.Err()
+			}
 			opts.Logger.Error("deleting old OCSP staples", zap.Error(err))
 		}
 	}
 	if opts.ExpiredCerts {
 		err := deleteExpiredCerts(ctx, storage, opts.Logger, opts.ExpiredCertGracePeriod)
 		if err != nil {
-			opts.Logger.Error("deleting expired certificates staples", zap.Error(err))
+			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+				return ctx.Err()
+			}
+			opts.Logger.Error("deleting expired certificates", zap.Error(err))
 		}
 	}
 	// TODO: delete stale locks?
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	// update the last-clean time
 	lastCleanBytes, err := json.Marshal(lastCleanPayload{
@@ -722,6 +740,9 @@ func CleanStorage(ctx context.Context, storage Storage, opts CleanStorageOptions
 		return fmt.Errorf("encoding last cleaned info: %v", err)
 	}
 	if err := storage.Store(ctx, storageKey, lastCleanBytes); err != nil {
+		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return fmt.Errorf("storing last clean info: %v", err)
 	}
 
@@ -738,18 +759,21 @@ type lastCleaned struct {
 func deleteOldOCSPStaples(ctx context.Context, storage Storage, logger *zap.Logger) error {
 	ocspKeys, err := storage.List(ctx, prefixOCSP, false)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+			return ctx.Err()
+		}
 		// maybe just hasn't been created yet; no big deal
 		return nil
 	}
 	for _, key := range ocspKeys {
-		// if context was cancelled, quit early; otherwise proceed
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		ocspBytes, err := storage.Load(ctx, key)
 		if err != nil {
+			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+				return ctx.Err()
+			}
 			logger.Error("while deleting old OCSP staples, unable to load staple file", zap.Error(err))
 			continue
 		}
@@ -758,6 +782,9 @@ func deleteOldOCSPStaples(ctx context.Context, storage Storage, logger *zap.Logg
 			// contents are invalid; delete it
 			err = storage.Delete(ctx, key)
 			if err != nil {
+				if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+					return ctx.Err()
+				}
 				logger.Error("purging corrupt staple file", zap.String("storage_key", key), zap.Error(err))
 			}
 			continue
@@ -766,6 +793,9 @@ func deleteOldOCSPStaples(ctx context.Context, storage Storage, logger *zap.Logg
 			// response has expired; delete it
 			err = storage.Delete(ctx, key)
 			if err != nil {
+				if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+					return ctx.Err()
+				}
 				logger.Error("purging expired staple file", zap.String("storage_key", key), zap.Error(err))
 			}
 		}
@@ -776,38 +806,53 @@ func deleteOldOCSPStaples(ctx context.Context, storage Storage, logger *zap.Logg
 func deleteExpiredCerts(ctx context.Context, storage Storage, logger *zap.Logger, gracePeriod time.Duration) error {
 	issuerKeys, err := storage.List(ctx, prefixCerts, false)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+			return ctx.Err()
+		}
 		// maybe just hasn't been created yet; no big deal
 		return nil
 	}
 
 	for _, issuerKey := range issuerKeys {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		siteKeys, err := storage.List(ctx, issuerKey, false)
 		if err != nil {
+			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+				return ctx.Err()
+			}
 			logger.Error("listing contents", zap.String("issuer_key", issuerKey), zap.Error(err))
 			continue
 		}
 
 		for _, siteKey := range siteKeys {
-			// if context was cancelled, quit early; otherwise proceed
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			default:
+			if err := ctx.Err(); err != nil {
+				return err
 			}
 
 			siteAssets, err := storage.List(ctx, siteKey, false)
 			if err != nil {
+				if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+					return ctx.Err()
+				}
 				logger.Error("listing site contents", zap.String("site_key", siteKey), zap.Error(err))
 				continue
 			}
 
 			for _, assetKey := range siteAssets {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
 				if path.Ext(assetKey) != ".crt" {
 					continue
 				}
 
 				certFile, err := storage.Load(ctx, assetKey)
 				if err != nil {
+					if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+						return ctx.Err()
+					}
 					return fmt.Errorf("loading certificate file %s: %v", assetKey, err)
 				}
 				block, _ := pem.Decode(certFile)
@@ -833,6 +878,9 @@ func deleteExpiredCerts(ctx context.Context, storage Storage, logger *zap.Logger
 						logger.Info("deleting asset because resource expired", zap.String("asset_key", relatedAsset))
 						err := storage.Delete(ctx, relatedAsset)
 						if err != nil {
+							if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+								return ctx.Err()
+							}
 							logger.Error("could not clean up asset related to expired certificate",
 								zap.String("base_name", baseName),
 								zap.String("related_asset", relatedAsset),
@@ -845,12 +893,18 @@ func deleteExpiredCerts(ctx context.Context, storage Storage, logger *zap.Logger
 			// update listing; if folder is empty, delete it
 			siteAssets, err = storage.List(ctx, siteKey, false)
 			if err != nil {
+				if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+					return ctx.Err()
+				}
 				continue
 			}
 			if len(siteAssets) == 0 {
 				logger.Info("deleting site folder because key is empty", zap.String("site_key", siteKey))
 				err := storage.Delete(ctx, siteKey)
 				if err != nil {
+					if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+						return ctx.Err()
+					}
 					return fmt.Errorf("deleting empty site folder %s: %v", siteKey, err)
 				}
 			}
