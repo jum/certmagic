@@ -92,10 +92,6 @@ func (certCache *Cache) maintainAssets(panicCount int) {
 func (certCache *Cache) RenewManagedCertificates(ctx context.Context) error {
 	log := certCache.logger.Named("maintenance")
 
-	// configs will hold a map of certificate hash to the config
-	// to use when managing that certificate
-	configs := make(map[string]*Config)
-
 	// we use the queues for a very important reason: to do any and all
 	// operations that could require an exclusive write lock outside
 	// of the read lock! otherwise we get a deadlock, yikes. in other
@@ -131,14 +127,11 @@ func (certCache *Cache) RenewManagedCertificates(ctx context.Context) error {
 
 		// ACME-specific: see if if ACME Renewal Info (ARI) window needs refreshing
 		if !cfg.DisableARI && cert.ari.NeedsRefresh() {
-			configs[cert.hash] = cfg
 			ariQueue = append(ariQueue, cert)
 		}
 
 		// if time is up or expires soon, we need to try to renew it
 		if cert.NeedsRenewal(cfg) {
-			configs[cert.hash] = cfg
-
 			// see if the certificate in storage has already been renewed, possibly by another
 			// instance that didn't coordinate with this one; if so, just load it (this
 			// might happen if another instance already renewed it - kinda sloppy but checking disk
@@ -169,7 +162,13 @@ func (certCache *Cache) RenewManagedCertificates(ctx context.Context) error {
 	// Update ARI, and then for any certs where the ARI window changed,
 	// be sure to queue them for renewal if necessary
 	for _, cert := range ariQueue {
-		cfg := configs[cert.hash]
+		cfg, err := certCache.getConfig(cert)
+		if err != nil {
+			log.Error("unable to get configuration for ARI update",
+				zap.Strings("identifiers", cert.Names),
+				zap.Error(err))
+			continue
+		}
 		cert, changed, err := cfg.updateARI(ctx, cert, log)
 		if err != nil {
 			log.Error("updating ARI", zap.Error(err))
@@ -192,10 +191,16 @@ func (certCache *Cache) RenewManagedCertificates(ctx context.Context) error {
 			zap.Strings("identifiers", oldCert.Names),
 			zap.Duration("remaining", timeLeft))
 
-		cfg := configs[oldCert.hash]
+		cfg, err := certCache.getConfig(oldCert)
+		if err != nil {
+			log.Error("unable to get configuration to reload certificate",
+				zap.Strings("identifiers", oldCert.Names),
+				zap.Error(err))
+			continue
+		}
 
 		// crucially, this happens OUTSIDE a lock on the certCache
-		_, err := cfg.reloadManagedCertificate(ctx, oldCert)
+		_, err = cfg.reloadManagedCertificate(ctx, oldCert)
 		if err != nil {
 			log.Error("loading renewed certificate",
 				zap.Strings("identifiers", oldCert.Names),
@@ -206,8 +211,14 @@ func (certCache *Cache) RenewManagedCertificates(ctx context.Context) error {
 
 	// Renewal queue
 	for _, oldCert := range renewQueue {
-		cfg := configs[oldCert.hash]
-		err := certCache.queueRenewalTask(ctx, oldCert, cfg)
+		cfg, err := certCache.getConfig(oldCert)
+		if err != nil {
+			log.Error("unable to get configuration to renew certificate",
+				zap.Strings("identifiers", oldCert.Names),
+				zap.Error(err))
+			continue
+		}
+		err = certCache.queueRenewalTask(ctx, oldCert, cfg)
 		if err != nil {
 			log.Error("queueing renewal task",
 				zap.Strings("identifiers", oldCert.Names),
@@ -245,6 +256,11 @@ func (certCache *Cache) queueRenewalTask(ctx context.Context, oldCert Certificat
 		log.Info("attempting certificate renewal",
 			zap.Strings("identifiers", oldCert.Names),
 			zap.Duration("remaining", timeLeft))
+
+		// re-obtain latest config in case a configuration reload occurred while queued
+		if latestCfg, err := certCache.getConfig(oldCert); err == nil && latestCfg != nil {
+			cfg = latestCfg
+		}
 
 		// perform renewal - crucially, this happens OUTSIDE a lock on certCache
 		err := cfg.RenewCertAsync(ctx, renewName, false)
@@ -339,6 +355,10 @@ func (certCache *Cache) updateOCSPStaples(ctx context.Context) {
 		cert := qe.cert
 		certHash := qe.certHash
 		lastNextUpdate := qe.lastNextUpdate
+
+		if currentCfg, err := certCache.getConfig(cert); err == nil && currentCfg != nil {
+			qe.cfg = currentCfg
+		}
 
 		if qe.cfg == nil {
 			// this is bad if this happens, probably a programmer error (oops)
@@ -584,6 +604,13 @@ func (cfg *Config) updateARI(ctx context.Context, cert Certificate, logger *zap.
 			updatedCert.ari = newARI
 			cfg.certCache.cache[cert.hash] = updatedCert
 			cfg.certCache.mu.Unlock()
+
+			// re-obtain latest config in case a configuration reload occurred while waiting for the ACME CA
+			if cfg.certCache != nil {
+				if latestCfg, err := cfg.certCache.getConfig(cert); err == nil && latestCfg != nil {
+					cfg = latestCfg
+				}
+			}
 
 			// update the ARI value in storage
 			var certData acme.Certificate
